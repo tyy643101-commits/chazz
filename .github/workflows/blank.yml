@@ -17,6 +17,9 @@ jobs:
           if [ -f "AndroidManifest.xml" ]; then mv AndroidManifest.xml app/src/main/AndroidManifest.xml; fi
           if [ -f "MainActivity.kt" ]; then mv MainActivity.kt app/src/main/java/com/example/chessoverlay/MainActivity.kt; fi
 
+          echo "android.useAndroidX=true" > gradle.properties
+          echo "android.enableJetifier=true" >> gradle.properties
+
           cat << 'EOF' > build.gradle
           plugins {
               id 'com.android.application' version '8.2.0' apply false
