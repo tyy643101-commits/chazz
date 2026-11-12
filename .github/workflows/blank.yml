@@ -11,11 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Auto-organize flat files into Android folders
+      - name: Generate Fixed Android 14 Project
         run: |
           mkdir -p app/src/main/java/com/example/chessoverlay
-          if [ -f "AndroidManifest.xml" ]; then mv AndroidManifest.xml app/src/main/AndroidManifest.xml; fi
-          if [ -f "MainActivity.kt" ]; then mv MainActivity.kt app/src/main/java/com/example/chessoverlay/MainActivity.kt; fi
+          rm -f AndroidManifest.xml MainActivity.kt
 
           echo "android.useAndroidX=true" > gradle.properties
           echo "android.enableJetifier=true" >> gradle.properties
@@ -38,9 +37,9 @@ jobs:
               defaultConfig {
                   applicationId "com.example.chessoverlay"
                   minSdk 26
-                  targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  targetSdk 33
+                  versionCode 2
+                  versionName "1.1"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -53,6 +52,592 @@ jobs:
           dependencies {
               implementation 'androidx.core:core-ktx:1.12.0'
               implementation 'androidx.appcompat:appcompat:1.6.1'
+          }
+          EOF
+
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Stockfish AutoArrow"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".OverlayService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF
+
+          cat << 'EOF' > app/src/main/java/com/example/chessoverlay/MainActivity.kt
+          package com.example.chessoverlay
+
+          import android.app.Activity
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.*
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.*
+          import android.provider.Settings
+          import android.view.*
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import kotlin.concurrent.thread
+          import kotlin.math.atan2
+          import kotlin.math.cos
+          import kotlin.math.sin
+          import kotlin.math.abs
+
+          object ProjectionHolder {
+              var resultCode: Int = Activity.RESULT_CANCELED
+              var data: Intent? = null
+          }
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var projectionManager: MediaProjectionManager
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+                  val layout = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#121212"))
+                      setPadding(48, 48, 48, 48)
+                  }
+
+                  val btnStart = Button(this).apply {
+                      text = "Запустить авто-сканер и стрелки"
+                      setOnClickListener {
+                          if (!Settings.canDrawOverlays(this@MainActivity)) {
+                              startActivityForResult(
+                                  Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")),
+                                  100
+                              )
+                          } else {
+                              startActivityForResult(projectionManager.createScreenCaptureIntent(), 101)
+                          }
+                      }
+                  }
+                  layout.addView(btnStart)
+                  setContentView(layout)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (requestCode == 101 && resultCode == Activity.RESULT_OK && data != null) {
+                      ProjectionHolder.resultCode = resultCode
+                      ProjectionHolder.data = data
+                      val serviceIntent = Intent(this, OverlayService::class.java)
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          startForegroundService(serviceIntent)
+                      } else {
+                          startService(serviceIntent)
+                      }
+                      finish()
+                  }
+              }
+          }
+
+          class OverlayService : Service() {
+              private lateinit var windowManager: WindowManager
+              private lateinit var controlBar: LinearLayout
+              private lateinit var boardOverlayView: BoardArrowView
+              private lateinit var boardParams: WindowManager.LayoutParams
+              private lateinit var statusText: TextView
+
+              private var mediaProjection: MediaProjection? = null
+              private var virtualDisplay: VirtualDisplay? = null
+              private var imageReader: ImageReader? = null
+
+              private var board = Array(8) { CharArray(8) }
+              private var prevCellHash = Array(8) { IntArray(8) }
+              private var hasBaseline = false
+              private var isLocked = false
+              private var isTracking = false
+              private var whiteTurn = true
+              private var isFlipped = false
+
+              private var arrowFromR = -1
+              private var arrowFromC = -1
+              private var arrowToR = -1
+              private var arrowToC = -1
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val scanRunnable = object : Runnable {
+                  override fun run() {
+                      if (isTracking && isLocked) {
+                          try { captureAndDetectMove() } catch (_: Exception) {}
+                      }
+                      handler.postDelayed(this, 900)
+                  }
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  try {
+                      startForegroundNotification()
+                      val rc = ProjectionHolder.resultCode
+                      val dt = ProjectionHolder.data
+                      if (rc == Activity.RESULT_OK && dt != null) {
+                          val pm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                          mediaProjection = pm.getMediaProjection(rc, dt)
+                          mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                              override fun onStop() {
+                                  virtualDisplay?.release()
+                              }
+                          }, handler)
+                          setupScreenCapture()
+                      }
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Ошибка старта: ${e.message}", Toast.LENGTH_LONG).show()
+                  }
+                  return START_NOT_STICKY
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+                  resetBoard()
+
+                  val metrics = resources.displayMetrics
+                  val defaultSize = (metrics.widthPixels * 0.90).toInt()
+
+                  boardParams = WindowManager.LayoutParams(
+                      defaultSize,
+                      defaultSize,
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                      else WindowManager.LayoutParams.TYPE_PHONE,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = (metrics.widthPixels - defaultSize) / 2
+                      y = 350
+                  }
+
+                  boardOverlayView = BoardArrowView(this)
+                  windowManager.addView(boardOverlayView, boardParams)
+
+                  val ctrlParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                      else WindowManager.LayoutParams.TYPE_PHONE,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                      y = 100
+                  }
+
+                  controlBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      setBackgroundColor(Color.parseColor("#E61E1E1E"))
+                      setPadding(16, 12, 16, 12)
+                      gravity = Gravity.CENTER_VERTICAL
+                  }
+
+                  statusText = TextView(this).apply {
+                      text = "Наведи рамку"
+                      setTextColor(Color.parseColor("#81C784"))
+                      textSize = 12f
+                      setPadding(0, 0, 14, 0)
+                  }
+
+                  val btnLock = makeBtn("🔓 Закрепить") { btn ->
+                      isLocked = !isLocked
+                      if (isLocked) {
+                          boardParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                  WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                          windowManager.updateViewLayout(boardOverlayView, boardParams)
+                          btn.text = "🔒 Скан ВКЛ"
+                          hasBaseline = false
+                          isTracking = true
+                          analyzePosition()
+                      } else {
+                          boardParams.flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                          windowManager.updateViewLayout(boardOverlayView, boardParams)
+                          btn.text = "🔓 Закрепить"
+                          isTracking = false
+                          statusText.text = "Наведи рамку"
+                      }
+                      boardOverlayView.invalidate()
+                  }
+
+                  val btnFlip = makeBtn("⇅ Ч/Б") {
+                      isFlipped = !isFlipped
+                      hasBaseline = false
+                      boardOverlayView.invalidate()
+                  }
+
+                  val btnReset = makeBtn("🔄 Сброс") {
+                      resetBoard()
+                      hasBaseline = false
+                      boardOverlayView.invalidate()
+                      statusText.text = "Сброшено"
+                  }
+
+                  val btnClose = makeBtn("✕") { stopSelf() }
+
+                  controlBar.addView(statusText)
+                  controlBar.addView(btnLock)
+                  controlBar.addView(btnFlip)
+                  controlBar.addView(btnReset)
+                  controlBar.addView(btnClose)
+
+                  windowManager.addView(controlBar, ctrlParams)
+                  handler.post(scanRunnable)
+              }
+
+              private fun makeBtn(txt: String, onClick: (TextView) -> Unit): TextView {
+                  return TextView(this).apply {
+                      text = txt
+                      setTextColor(Color.WHITE)
+                      textSize = 11f
+                      setBackgroundColor(Color.parseColor("#3E3E3E"))
+                      setPadding(14, 10, 14, 10)
+                      val lp = LinearLayout.LayoutParams(-2, -2).apply { setMargins(5, 0, 5, 0) }
+                      layoutParams = lp
+                      setOnClickListener { onClick(this) }
+                  }
+              }
+
+              private fun setupScreenCapture() {
+                  val metrics = resources.displayMetrics
+                  imageReader = ImageReader.newInstance(metrics.widthPixels, metrics.heightPixels, PixelFormat.RGBA_8888, 2)
+                  virtualDisplay = mediaProjection?.createVirtualDisplay(
+                      "ChessCap",
+                      metrics.widthPixels, metrics.heightPixels, metrics.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                      imageReader?.surface, null, handler
+                  )
+              }
+
+              private fun captureAndDetectMove() {
+                  val img = imageReader?.acquireLatestImage() ?: return
+                  try {
+                      val plane = img.planes[0]
+                      val buf = plane.buffer
+                      val pixelStride = plane.pixelStride
+                      val rowStride = plane.rowStride
+
+                      val loc = IntArray(2)
+                      boardOverlayView.getLocationOnScreen(loc)
+                      val bx = loc[0]
+                      val by = loc[1]
+                      val bw = boardOverlayView.width
+                      val bh = boardOverlayView.height
+                      val cellW = bw / 8
+                      val cellH = bh / 8
+
+                      val currentHash = Array(8) { IntArray(8) }
+                      val changedCells = mutableListOf<Pair<Int, Int>>()
+
+                      for (uiR in 0..7) {
+                          for (uiC in 0..7) {
+                              val realR = if (isFlipped) 7 - uiR else uiR
+                              val realC = if (isFlipped) 7 - uiC else uiC
+
+                              var sumR = 0; var sumG = 0; var sumB = 0
+                              val cx = bx + uiC * cellW + cellW / 2
+                              val cy = by + uiR * cellH + cellH / 2
+
+                              for (dy in -6..6 step 6) {
+                                  for (dx in -6..6 step 6) {
+                                      val px = (cx + dx).coerceIn(0, img.width - 1)
+                                      val py = (cy + dy).coerceIn(0, img.height - 1)
+                                      val offset = py * rowStride + px * pixelStride
+                                      sumR += buf.get(offset).toInt() and 0xFF
+                                      sumG += buf.get(offset + 1).toInt() and 0xFF
+                                      sumB += buf.get(offset + 2).toInt() and 0xFF
+                                  }
+                              }
+                              val avgBrightness = (sumR + sumG + sumB) / 27
+                              currentHash[realR][realC] = avgBrightness
+
+                              if (hasBaseline && abs(avgBrightness - prevCellHash[realR][realC]) > 18) {
+                                  changedCells.add(Pair(realR, realC))
+                              }
+                          }
+                      }
+
+                      if (!hasBaseline) {
+                          prevCellHash = currentHash
+                          hasBaseline = true
+                          return
+                      }
+
+                      if (changedCells.size == 2) {
+                          val (r1, c1) = changedCells[0]
+                          val (r2, c2) = changedCells[1]
+
+                          val p1 = board[r1][c1]
+                          val p2 = board[r2][c2]
+
+                          val isP1TurnPiece = (whiteTurn && p1.isUpperCase()) || (!whiteTurn && p1.isLowerCase())
+                          val isP2TurnPiece = (whiteTurn && p2.isUpperCase()) || (!whiteTurn && p2.isLowerCase())
+
+                          if (isP1TurnPiece && p1 != '.') {
+                              applyDetectedMove(r1, c1, r2, c2)
+                              prevCellHash = currentHash
+                          } else if (isP2TurnPiece && p2 != '.') {
+                              applyDetectedMove(r2, c2, r1, c1)
+                              prevCellHash = currentHash
+                          }
+                      }
+                  } finally {
+                      img.close()
+                  }
+              }
+
+              private fun applyDetectedMove(fromR: Int, fromC: Int, toR: Int, toC: Int) {
+                  val piece = board[fromR][fromC]
+                  board[toR][toC] = piece
+                  board[fromR][fromC] = '.'
+                  if (piece == 'P' && toR == 0) board[toR][toC] = 'Q'
+                  if (piece == 'p' && toR == 7) board[toR][toC] = 'q'
+
+                  whiteTurn = !whiteTurn
+                  arrowFromR = -1; arrowToR = -1
+                  boardOverlayView.invalidate()
+
+                  val myTurnNow = (!isFlipped && whiteTurn) || (isFlipped && !whiteTurn)
+                  if (myTurnNow) {
+                      analyzePosition()
+                  } else {
+                      statusText.text = "Ход соперника..."
+                  }
+              }
+
+              private fun analyzePosition() {
+                  val fen = buildFen()
+                  statusText.text = "Считаю..."
+                  thread {
+                      try {
+                          val enc = URLEncoder.encode(fen, "UTF-8")
+                          val conn = URL("https://stockfish.online/api/s/v2.php?fen=$enc&depth=14").openConnection() as HttpURLConnection
+                          conn.connectTimeout = 5000
+                          val json = JSONObject(conn.inputStream.bufferedReader().readText())
+                          if (json.getBoolean("success")) {
+                              val uci = json.getString("bestmove").split(" ").getOrNull(1) ?: ""
+                              val eval = json.optString("evaluation", "0.0")
+                              if (uci.length >= 4) {
+                                  arrowFromC = uci[0] - 'a'
+                                  arrowFromR = 8 - (uci[1] - '0')
+                                  arrowToC = uci[2] - 'a'
+                                  arrowToR = 8 - (uci[3] - '0')
+                              }
+                              handler.post {
+                                  statusText.text = "Ход: $uci ($eval)"
+                                  boardOverlayView.invalidate()
+                              }
+                          }
+                      } catch (e: Exception) {
+                          handler.post { statusText.text = "Ошибка сети" }
+                      }
+                  }
+              }
+
+              private fun buildFen(): String {
+                  val sb = StringBuilder()
+                  for (r in 0..7) {
+                      var empty = 0
+                      for (c in 0..7) {
+                          val p = board[r][c]
+                          if (p == '.') empty++ else {
+                              if (empty > 0) { sb.append(empty); empty = 0 }
+                              sb.append(p)
+                          }
+                      }
+                      if (empty > 0) sb.append(empty)
+                      if (r < 7) sb.append('/')
+                  }
+                  sb.append(if (whiteTurn) " w KQkq - 0 1" else " b KQkq - 0 1")
+                  return sb.toString()
+              }
+
+              private fun resetBoard() {
+                  val start = arrayOf("rnbqkbnr", "pppppppp", "........", "........", "........", "........", "PPPPPPPP", "RNBQKBNR")
+                  for (r in 0..7) board[r] = start[r].toCharArray()
+                  whiteTurn = true
+                  arrowFromR = -1; arrowToR = -1
+              }
+
+              inner class BoardArrowView(ctx: Context) : View(ctx) {
+                  private val borderPaint = Paint().apply {
+                      color = Color.parseColor("#00E676")
+                      style = Paint.Style.STROKE
+                      strokeWidth = 5f
+                  }
+                  private val gridPaint = Paint().apply {
+                      color = Color.parseColor("#5500E676")
+                      style = Paint.Style.STROKE
+                      strokeWidth = 2f
+                  }
+                  private val arrowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.parseColor("#CC00E676")
+                      style = Paint.Style.STROKE
+                      strokeWidth = 18f
+                      strokeCap = Paint.Cap.ROUND
+                  }
+                  private val headPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                      color = Color.parseColor("#CC00E676")
+                      style = Paint.Style.FILL
+                  }
+
+                  private var lastX = 0f
+                  private var lastY = 0f
+                  private var resizing = false
+
+                  override fun onDraw(canvas: Canvas) {
+                      super.onDraw(canvas)
+                      val w = width.toFloat()
+                      val h = height.toFloat()
+                      val cw = w / 8f
+                      val ch = h / 8f
+
+                      if (!isLocked) {
+                          canvas.drawRect(0f, 0f, w, h, borderPaint)
+                          for (i in 1..7) {
+                              canvas.drawLine(i * cw, 0f, i * cw, h, gridPaint)
+                              canvas.drawLine(0f, i * ch, w, i * ch, gridPaint)
+                          }
+                          canvas.drawCircle(w - 20f, h - 20f, 28f, headPaint)
+                      }
+
+                      if (arrowFromR != -1 && arrowToR != -1) {
+                          val fR = if (isFlipped) 7 - arrowFromR else arrowFromR
+                          val fC = if (isFlipped) 7 - arrowFromC else arrowFromC
+                          val tR = if (isFlipped) 7 - arrowToR else arrowToR
+                          val tC = if (isFlipped) 7 - arrowToC else arrowToC
+
+                          val startX = fC * cw + cw / 2f
+                          val startY = fR * ch + ch / 2f
+                          val endX = tC * cw + cw / 2f
+                          val endY = tR * ch + ch / 2f
+
+                          canvas.drawLine(startX, startY, endX, endY, arrowPaint)
+
+                          val angle = atan2((endY - startY).toDouble(), (endX - startX).toDouble())
+                          val headLen = 42f
+                          val path = Path().apply {
+                              moveTo(endX, endY)
+                              lineTo(
+                                  (endX - headLen * cos(angle - Math.PI / 6)).toFloat(),
+                                  (endY - headLen * sin(angle - Math.PI / 6)).toFloat()
+                              )
+                              lineTo(
+                                  (endX - headLen * cos(angle + Math.PI / 6)).toFloat(),
+                                  (endY - headLen * sin(angle + Math.PI / 6)).toFloat()
+                              )
+                              close()
+                          }
+                          canvas.drawPath(path, headPaint)
+                      }
+                  }
+
+                  override fun onTouchEvent(e: MotionEvent): Boolean {
+                      if (isLocked) return false
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              lastX = e.rawX
+                              lastY = e.rawY
+                              resizing = (e.x > width - 80 && e.y > height - 80)
+                              return true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (e.rawX - lastX).toInt()
+                              val dy = (e.rawY - lastY).toInt()
+                              if (resizing) {
+                                  val newSize = (boardParams.width + maxOf(dx, dy)).coerceIn(300, 1400)
+                                  boardParams.width = newSize
+                                  boardParams.height = newSize
+                              } else {
+                                  boardParams.x += dx
+                                  boardParams.y += dy
+                              }
+                              lastX = e.rawX
+                              lastY = e.rawY
+                              windowManager.updateViewLayout(this, boardParams)
+                              invalidate()
+                              return true
+                          }
+                      }
+                      return false
+                  }
+              }
+
+              private fun startForegroundNotification() {
+                  val chanId = "chess_overlay_channel"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val chan = NotificationChannel(chanId, "Stockfish Overlay", NotificationManager.IMPORTANCE_LOW)
+                      getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
+                  }
+                  val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      Notification.Builder(this, chanId)
+                          .setContentTitle("Stockfish AutoArrow активен")
+                          .setSmallIcon(android.R.drawable.ic_dialog_info)
+                          .build()
+                  } else {
+                      Notification.Builder(this).setContentTitle("Stockfish активен").build()
+                  }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                  } else {
+                      startForeground(1, notif)
+                  }
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  handler.removeCallbacks(scanRunnable)
+                  virtualDisplay?.release()
+                  mediaProjection?.stop()
+                  if (::boardOverlayView.isInitialized) windowManager.removeView(boardOverlayView)
+                  if (::controlBar.isInitialized) windowManager.removeView(controlBar)
+              }
           }
           EOF
 
